@@ -23,6 +23,7 @@ from .fixtures.known_frames import (
     MID_FRAME,
     ZERO_FRAME,
     build_frame,
+    frame_with_corrupted_checksum,
     frame_with_packet_type,
 )
 
@@ -170,9 +171,7 @@ def test_feed_swallows_invalid_packet_and_increments_error_count() -> None:
     error, and not raise."""
 
     parser = AtorchBleParser()
-    bad = bytearray(CANONICAL_FRAME)
-    bad[0x21] = (bad[0x21] ^ 0xFF) & 0xFF
-    readings = parser.feed(bytes(bad))
+    readings = parser.feed(frame_with_corrupted_checksum())
     assert readings == []
     assert parser.error_count == 1
     assert parser.last_error is not None
@@ -180,13 +179,8 @@ def test_feed_swallows_invalid_packet_and_increments_error_count() -> None:
 
 def test_error_count_accumulates_across_calls() -> None:
     parser = AtorchBleParser()
-    bad1 = bytearray(CANONICAL_FRAME)
-    bad1[0x21] = (bad1[0x21] ^ 0xFF) & 0xFF
-    bad2 = bytearray(MID_FRAME)
-    bad2[0x21] = (bad2[0x21] ^ 0xFF) & 0xFF
-
-    parser.feed(bytes(bad1))
-    parser.feed(bytes(bad2))
+    parser.feed(frame_with_corrupted_checksum())
+    parser.feed(frame_with_corrupted_checksum(MID_FRAME))
     assert parser.error_count == 2
 
 
@@ -196,10 +190,7 @@ def test_mixed_stream_one_valid_one_invalid_yields_one_and_records_one_error() -
     swallowed and counted."""
 
     parser = AtorchBleParser()
-    bad = bytearray(MID_FRAME)
-    bad[0x21] = (bad[0x21] ^ 0xFF) & 0xFF
-
-    readings = parser.feed(CANONICAL_FRAME + bytes(bad))
+    readings = parser.feed(CANONICAL_FRAME + frame_with_corrupted_checksum(MID_FRAME))
     assert len(readings) == 1
     assert readings[0].voltage_v == 5.12
     assert parser.error_count == 1

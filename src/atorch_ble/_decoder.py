@@ -25,19 +25,6 @@ _DIR_FROM_DEVICE: int = 0x01
 _TYPE_USB_METER: int = 0x03
 _EXPECTED_LEN: int = 36
 
-_CHECKSUM_VALIDATED: bool = True
-"""Gate for checksum enforcement.
-
-The documented Atorch checksum formula is
-``(sum(payload[2:33]) & 0xFF) ^ 0x44``. Ticket #4 verified this formula
-is self-consistent against synthetic frames constructed from the
-PROJECT_CONTEXT.md offset table (Option B in that ticket's acceptance
-criteria); we have not yet verified the byte against a real captured
-frame, but the formula is self-checking via the test suite's
-fixture-built frames. With this flag ``True``,
-:func:`decode_usb_meter` raises :class:`InvalidPacket` on mismatch.
-"""
-
 
 class InvalidPacket(ValueError):
     """Raised when a payload fails structural or checksum validation."""
@@ -78,13 +65,11 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
     ``voltage_v / current_a`` when ``current_a > 0``).
 
     Checksum behaviour: the documented formula
-    ``(sum(payload[2:33]) & 0xFF) ^ 0x44`` is computed unconditionally,
-    and enforcement is gated by :data:`_CHECKSUM_VALIDATED`. Ticket #4
-    flipped that flag to ``True`` after fixture-driven verification
-    against synthetic frames built from the PROJECT_CONTEXT.md offset
-    table; the formula has not yet been independently confirmed against
-    a real captured frame's checksum byte, but the test suite asserts
-    self-consistency.
+    ``(sum(payload[2:33]) & 0xFF) ^ 0x44`` is enforced; on mismatch
+    :class:`InvalidPacket` is raised. The formula has not been
+    independently confirmed against a real captured frame's checksum
+    byte, but the test suite asserts self-consistency against
+    fixture-built frames.
 
     Args:
         payload: The reassembled 36-byte BLE frame.
@@ -94,9 +79,8 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
         declared units.
 
     Raises:
-        InvalidPacket: On wrong length, bad magic, wrong direction byte, or
-            (when :data:`_CHECKSUM_VALIDATED` is ``True``) checksum
-            mismatch.
+        InvalidPacket: On wrong length, bad magic, wrong direction byte,
+            or checksum mismatch.
         UnsupportedPacketType: When the packet-type byte is not ``0x03``.
     """
 
@@ -113,7 +97,7 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
         raise UnsupportedPacketType(packet_type=payload[3])
 
     expected_checksum = (sum(payload[2:33]) & 0xFF) ^ 0x44
-    if _CHECKSUM_VALIDATED and payload[0x21] != expected_checksum:
+    if payload[0x21] != expected_checksum:
         raise InvalidPacket(
             f"checksum mismatch: got 0x{payload[0x21]:02x}, expected 0x{expected_checksum:02x}"
         )

@@ -17,7 +17,7 @@ synthetic frame below is constructed from that table; the expected
 decoded values are computed by hand from the same table — **not** by
 calling the decoder under test. The checksum byte is computed via the
 documented XOR formula so that the frame stays valid when the decoder's
-``_CHECKSUM_VALIDATED`` flag is on.
+checksum gate.
 
 Byte layout (USB-meter packet type 0x03), per PROJECT_CONTEXT.md:
 
@@ -48,6 +48,16 @@ from __future__ import annotations
 from typing import Final
 
 FRAME_SIZE: Final[int] = 36
+
+
+def _compute_checksum(body: bytes | bytearray) -> int:
+    """Compute the Atorch checksum byte for an in-progress frame.
+
+    The documented formula is ``(sum(body[2:33]) & 0xFF) ^ 0x44``.
+    Centralized here so the (sum, XOR-mask) pair has one home.
+    """
+
+    return (sum(body[2:33]) & 0xFF) ^ 0x44
 
 
 def build_frame(
@@ -94,7 +104,7 @@ def build_frame(
     body[0x1A] = seconds
 
     # 0x1B..0x20 reserved (zero-filled).
-    body[0x21] = (sum(body[2:33]) & 0xFF) ^ 0x44
+    body[0x21] = _compute_checksum(body)
     # 0x22..0x23 tail (zero-filled).
     return bytes(body)
 
@@ -184,7 +194,7 @@ def _build_max_frame() -> bytes:
     body[0x18] = 0xFF
     body[0x19] = 0xFF
     body[0x1A] = 0xFF
-    body[0x21] = (sum(body[2:33]) & 0xFF) ^ 0x44
+    body[0x21] = _compute_checksum(body)
     return bytes(body)
 
 
@@ -258,9 +268,13 @@ def frame_too_long() -> bytes:
     return CANONICAL_FRAME + b"\x00" * 4
 
 
-def frame_with_corrupted_checksum() -> bytes:
-    """Canonical frame with the checksum byte flipped to an invalid value."""
+def frame_with_corrupted_checksum(source: bytes = CANONICAL_FRAME) -> bytes:
+    """Return ``source`` with its checksum byte flipped to an invalid value.
 
-    bad = bytearray(CANONICAL_FRAME)
+    Defaults to corrupting :data:`CANONICAL_FRAME`; pass any other valid
+    36-byte Atorch frame to produce a corrupted variant of that frame.
+    """
+
+    bad = bytearray(source)
     bad[0x21] = (bad[0x21] ^ 0xFF) & 0xFF
     return bytes(bad)

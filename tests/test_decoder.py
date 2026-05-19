@@ -13,7 +13,6 @@ import pytest
 from atorch_ble import InvalidPacket, UnsupportedPacketType, UsbMeterReading
 from atorch_ble._decoder import decode_usb_meter
 
-from .conftest import _CHECKSUM_VALIDATED
 from .fixtures.known_frames import (
     CANONICAL_EXPECTED,
     CANONICAL_FRAME,
@@ -23,6 +22,7 @@ from .fixtures.known_frames import (
     MID_FRAME,
     ZERO_EXPECTED,
     ZERO_FRAME,
+    _compute_checksum,
     build_frame,
     frame_too_long,
     frame_too_short,
@@ -132,7 +132,7 @@ def test_temperature_is_unsigned_u16() -> None:
     frame = bytearray(CANONICAL_FRAME)
     frame[0x15:0x17] = b"\xff\xff"
     # Recompute the checksum so this still passes the gate.
-    frame[0x21] = (sum(frame[2:33]) & 0xFF) ^ 0x44
+    frame[0x21] = _compute_checksum(frame)
     reading = decode_usb_meter(bytes(frame))
     assert reading.temperature_c == 65535
 
@@ -143,7 +143,7 @@ def test_big_endian_voltage_encoding() -> None:
     raw = 0x010000  # = 65_536
     frame = bytearray(CANONICAL_FRAME)
     frame[0x04:0x07] = raw.to_bytes(3, "big")
-    frame[0x21] = (sum(frame[2:33]) & 0xFF) ^ 0x44
+    frame[0x21] = _compute_checksum(frame)
     reading = decode_usb_meter(bytes(frame))
     assert reading.voltage_v == raw / 100.0
 
@@ -188,23 +188,15 @@ def test_unsupported_packet_type_is_invalid_packet_subclass() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Checksum validation (gated by the shared _CHECKSUM_VALIDATED flag)
+# Checksum validation
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not _CHECKSUM_VALIDATED,
-    reason="checksum formula not yet confirmed; see ticket #3 / #4",
-)
 def test_corrupted_checksum_raises_invalid_packet() -> None:
     with pytest.raises(InvalidPacket):
         decode_usb_meter(frame_with_corrupted_checksum())
 
 
-@pytest.mark.skipif(
-    not _CHECKSUM_VALIDATED,
-    reason="checksum formula not yet confirmed; see ticket #3 / #4",
-)
 def test_canonical_frame_passes_checksum_gate() -> None:
     """The build_frame helper computes the same XOR formula the decoder
     enforces, so the canonical frame must decode without raising."""
