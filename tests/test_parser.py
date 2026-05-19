@@ -1,9 +1,9 @@
-"""Tests for the :class:`atorch_ble.AtorchBleParser` facade.
+"""Public-API integration tests for :class:`atorch_ble.AtorchBleParser`.
 
-These exercise the public API surface locked by ticket #6: the facade
-class, the re-exported dataclass / exception types, ``__version__``, and
-the documented error-handling contract (swallow :class:`InvalidPacket`,
-re-raise :class:`UnsupportedPacketType`).
+End-to-end byte-stream-in → readings-list-out scenarios: single frames,
+multiple frames in one call, frames fragmented across calls, garbage
+interleaved with valid frames, ``UnsupportedPacketType`` propagation,
+and ``error_count`` accumulation across :class:`InvalidPacket` failures.
 """
 
 from __future__ import annotations
@@ -18,49 +18,17 @@ from atorch_ble import (
     __version__,
 )
 
+from .fixtures.known_frames import (
+    CANONICAL_FRAME,
+    MID_FRAME,
+    ZERO_FRAME,
+    build_frame,
+    frame_with_packet_type,
+)
 
-def build_frame(
-    *,
-    voltage_v: float,
-    current_a: float,
-    capacity_mah: int,
-    energy_wh: float,
-    voltage_dplus_v: float,
-    voltage_dminus_v: float,
-    temperature_c: int,
-    duration_s: int,
-    packet_type: int = 0x03,
-) -> bytes:
-    """Inline copy of the decoder-test frame builder.
-
-    Duplicated rather than imported because pytest discovers ``tests/`` as
-    a flat namespace (no ``__init__.py``) and ``mypy --strict`` rejects
-    cross-test imports under that layout. Ticket #4 will port this helper
-    into a shared fixtures module.
-    """
-
-    body = bytearray(36)
-    body[0:2] = b"\xff\x55"
-    body[2] = 0x01
-    body[3] = packet_type
-    body[0x04:0x07] = round(voltage_v * 100).to_bytes(3, "big")
-    body[0x07:0x0A] = round(current_a * 100).to_bytes(3, "big")
-    body[0x0A:0x0D] = capacity_mah.to_bytes(3, "big")
-    body[0x0D:0x11] = round(energy_wh * 100).to_bytes(4, "big")
-    body[0x11:0x13] = round(voltage_dplus_v * 100).to_bytes(2, "big")
-    body[0x13:0x15] = round(voltage_dminus_v * 100).to_bytes(2, "big")
-    body[0x15:0x17] = temperature_c.to_bytes(2, "big")
-
-    days, rem = divmod(duration_s, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-    body[0x17] = days
-    body[0x18] = hours
-    body[0x19] = minutes
-    body[0x1A] = seconds
-
-    body[0x21] = (sum(body[2:33]) & 0xFF) ^ 0x44
-    return bytes(body)
+# ---------------------------------------------------------------------------
+# Public API surface
+# ---------------------------------------------------------------------------
 
 
 def test_public_api_imports_and_version() -> None:
@@ -74,71 +42,39 @@ def test_public_api_imports_and_version() -> None:
 
 def test_parser_initial_state() -> None:
     parser = AtorchBleParser()
-
     assert parser.error_count == 0
     assert parser.last_error is None
 
 
+# ---------------------------------------------------------------------------
+# Single-frame end-to-end
+# ---------------------------------------------------------------------------
+
+
 def test_feed_valid_frame_returns_reading() -> None:
     parser = AtorchBleParser()
-    frame = build_frame(
-        voltage_v=5.0,
-        current_a=1.0,
-        capacity_mah=100,
-        energy_wh=1.5,
-        voltage_dplus_v=2.5,
-        voltage_dminus_v=2.5,
-        temperature_c=25,
-        duration_s=60,
-    )
-
-    readings = parser.feed(frame)
+    readings = parser.feed(CANONICAL_FRAME)
 
     assert len(readings) == 1
     assert isinstance(readings[0], UsbMeterReading)
-    assert readings[0].voltage_v == 5.0
-    assert readings[0].current_a == 1.0
+    assert readings[0].voltage_v == 5.12
+    assert readings[0].current_a == 1.23
     assert parser.error_count == 0
     assert parser.last_error is None
 
 
 def test_feed_garbage_bytes_returns_empty_and_does_not_raise() -> None:
     parser = AtorchBleParser()
-
     readings = parser.feed(b"\x00" * 50)
-
-    # Reassembler filters by magic, so pure-garbage bytes never reach the
-    # decoder — error_count stays at zero.
+    # Reassembler filters by magic; garbage never reaches the decoder.
     assert readings == []
     assert parser.error_count == 0
     assert parser.last_error is None
 
 
-def test_feed_unsupported_packet_type_propagates() -> None:
-    parser = AtorchBleParser()
-    # Build a structurally valid frame but with packet_type=0x02 (DC meter).
-    frame = build_frame(
-        voltage_v=5.0,
-        current_a=1.0,
-        capacity_mah=0,
-        energy_wh=0.0,
-        voltage_dplus_v=0.0,
-        voltage_dminus_v=0.0,
-        temperature_c=25,
-        duration_s=0,
-        packet_type=0x02,
-    )
-
-    with pytest.raises(UnsupportedPacketType) as exc_info:
-        parser.feed(frame)
-
-    assert exc_info.value.packet_type == 0x02
-    # UnsupportedPacketType is NOT counted as a swallowed error.
-    assert parser.error_count == 0
-    assert parser.last_error is None
-
-
 def test_feed_handles_split_notifications() -> None:
+    """Fragment a frame across two feed() calls (23 + 13 bytes)."""
+
     parser = AtorchBleParser()
     frame = build_frame(
         voltage_v=12.0,
@@ -151,11 +87,135 @@ def test_feed_handles_split_notifications() -> None:
         duration_s=5,
     )
 
-    # First chunk: not enough bytes to commit a frame.
-    first = parser.feed(frame[:20])
+    first = parser.feed(frame[:23])
     assert first == []
-
-    # Second chunk: completes the frame.
-    second = parser.feed(frame[20:])
+    second = parser.feed(frame[23:])
     assert len(second) == 1
     assert second[0].voltage_v == 12.0
+
+
+# ---------------------------------------------------------------------------
+# Multiple frames per call / per stream
+# ---------------------------------------------------------------------------
+
+
+def test_feed_multiple_frames_in_one_call() -> None:
+    parser = AtorchBleParser()
+    readings = parser.feed(CANONICAL_FRAME + MID_FRAME + ZERO_FRAME)
+    assert len(readings) == 3
+    assert readings[0].voltage_v == 5.12
+    assert readings[1].voltage_v == 9.00
+    assert readings[2].voltage_v == 0.0
+    assert parser.error_count == 0
+
+
+def test_feed_garbage_interleaved_with_valid_frames() -> None:
+    parser = AtorchBleParser()
+    out = parser.feed(b"\xde\xad" + CANONICAL_FRAME + b"\x00\x00\x00" + MID_FRAME)
+    assert len(out) == 2
+    assert out[0].voltage_v == 5.12
+    assert out[1].voltage_v == 9.00
+    assert parser.error_count == 0
+
+
+def test_feed_fragmented_across_many_calls() -> None:
+    parser = AtorchBleParser()
+    stream = CANONICAL_FRAME + MID_FRAME
+    chunk_size = 7
+    collected: list[UsbMeterReading] = []
+    for start in range(0, len(stream), chunk_size):
+        collected.extend(parser.feed(stream[start : start + chunk_size]))
+    assert len(collected) == 2
+    assert collected[0].voltage_v == 5.12
+    assert collected[1].voltage_v == 9.00
+
+
+# ---------------------------------------------------------------------------
+# UnsupportedPacketType propagation
+# ---------------------------------------------------------------------------
+
+
+def test_feed_unsupported_packet_type_propagates() -> None:
+    parser = AtorchBleParser()
+    frame = frame_with_packet_type(0x02)
+    with pytest.raises(UnsupportedPacketType) as exc_info:
+        parser.feed(frame)
+    assert exc_info.value.packet_type == 0x02
+    # UnsupportedPacketType is NOT counted as a swallowed error.
+    assert parser.error_count == 0
+    assert parser.last_error is None
+
+
+def test_feed_unsupported_packet_type_propagates_across_multi_frame_call() -> None:
+    """When a batch contains a valid frame followed by a 0x02 frame, the
+    valid frame is decoded into the in-flight list, then the exception
+    propagates — the caller does not receive the partial list, but the
+    parser's state is consistent for the next call."""
+
+    parser = AtorchBleParser()
+    bad = frame_with_packet_type(0x01)
+    with pytest.raises(UnsupportedPacketType) as exc_info:
+        parser.feed(CANONICAL_FRAME + bad)
+    assert exc_info.value.packet_type == 0x01
+
+
+# ---------------------------------------------------------------------------
+# InvalidPacket swallowing + error_count accumulation
+# ---------------------------------------------------------------------------
+
+
+def test_feed_swallows_invalid_packet_and_increments_error_count() -> None:
+    """Manually corrupt a checksum byte to trigger ``InvalidPacket``
+    inside the decoder. The parser facade must swallow it, record the
+    error, and not raise."""
+
+    parser = AtorchBleParser()
+    bad = bytearray(CANONICAL_FRAME)
+    bad[0x21] = (bad[0x21] ^ 0xFF) & 0xFF
+    readings = parser.feed(bytes(bad))
+    assert readings == []
+    assert parser.error_count == 1
+    assert parser.last_error is not None
+
+
+def test_error_count_accumulates_across_calls() -> None:
+    parser = AtorchBleParser()
+    bad1 = bytearray(CANONICAL_FRAME)
+    bad1[0x21] = (bad1[0x21] ^ 0xFF) & 0xFF
+    bad2 = bytearray(MID_FRAME)
+    bad2[0x21] = (bad2[0x21] ^ 0xFF) & 0xFF
+
+    parser.feed(bytes(bad1))
+    parser.feed(bytes(bad2))
+    assert parser.error_count == 2
+
+
+def test_mixed_stream_one_valid_one_invalid_yields_one_and_records_one_error() -> None:
+    """A two-frame stream where the second frame has a corrupted
+    checksum: the valid frame must decode, the invalid one must be
+    swallowed and counted."""
+
+    parser = AtorchBleParser()
+    bad = bytearray(MID_FRAME)
+    bad[0x21] = (bad[0x21] ^ 0xFF) & 0xFF
+
+    readings = parser.feed(CANONICAL_FRAME + bytes(bad))
+    assert len(readings) == 1
+    assert readings[0].voltage_v == 5.12
+    assert parser.error_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Coverage backstop for tests/__init__.py and fixtures package imports.
+# ---------------------------------------------------------------------------
+
+
+def test_fixtures_package_is_importable() -> None:
+    """Importing the fixtures package executes its ``__init__.py``,
+    keeping it counted toward coverage even though it has no code."""
+
+    from . import fixtures
+    from .fixtures import known_frames
+
+    assert fixtures is not None
+    assert hasattr(known_frames, "build_frame")

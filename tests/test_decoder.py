@@ -1,167 +1,222 @@
-"""Smoke tests for :mod:`atorch_ble._decoder`.
+"""Comprehensive tests for :mod:`atorch_ble._decoder`.
 
-Comprehensive coverage (real-capture fixtures, hypothesis fuzzing, the
-checksum-validation flip) is ticket #4; this module only verifies that the
-happy path and the four documented rejection gates behave as specified.
+Covers every behavior listed in ticket #3's acceptance criteria: field
+scaling, big-endian decoding, duration-component arithmetic, rejection
+gates (length, magic, direction, unsupported packet type), and (when
+enabled by the shared flag) checksum validation.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from atorch_ble._decoder import (
-    InvalidPacket,
-    UnsupportedPacketType,
-    UsbMeterReading,
-    decode_usb_meter,
+from atorch_ble import InvalidPacket, UnsupportedPacketType, UsbMeterReading
+from atorch_ble._decoder import decode_usb_meter
+
+from .conftest import _CHECKSUM_VALIDATED
+from .fixtures.known_frames import (
+    CANONICAL_EXPECTED,
+    CANONICAL_FRAME,
+    MAX_EXPECTED,
+    MAX_FRAME,
+    MID_EXPECTED,
+    MID_FRAME,
+    ZERO_EXPECTED,
+    ZERO_FRAME,
+    build_frame,
+    frame_too_long,
+    frame_too_short,
+    frame_with_bad_direction,
+    frame_with_bad_magic,
+    frame_with_corrupted_checksum,
+    frame_with_packet_type,
 )
 
 
-def _u24_be(value: int) -> bytes:
-    return value.to_bytes(3, "big", signed=False)
+def _reading_dict(reading: UsbMeterReading) -> dict[str, float | int]:
+    return {
+        "voltage_v": reading.voltage_v,
+        "current_a": reading.current_a,
+        "capacity_mah": reading.capacity_mah,
+        "energy_wh": reading.energy_wh,
+        "voltage_dplus_v": reading.voltage_dplus_v,
+        "voltage_dminus_v": reading.voltage_dminus_v,
+        "temperature_c": reading.temperature_c,
+        "duration_s": reading.duration_s,
+    }
 
 
-def _u32_be(value: int) -> bytes:
-    return value.to_bytes(4, "big", signed=False)
+# ---------------------------------------------------------------------------
+# Happy-path: canonical, zero, max, mid-range frames
+# ---------------------------------------------------------------------------
 
 
-def _u16_be(value: int) -> bytes:
-    return value.to_bytes(2, "big", signed=False)
+def test_decode_canonical_frame_matches_hand_computed_expected() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert _reading_dict(reading) == CANONICAL_EXPECTED
 
 
-def build_frame(
-    *,
-    voltage_v: float,
-    current_a: float,
-    capacity_mah: int,
-    energy_wh: float,
-    voltage_dplus_v: float,
-    voltage_dminus_v: float,
-    temperature_c: int,
-    duration_s: int,
-    packet_type: int = 0x03,
-) -> bytes:
-    """Build a 36-byte Atorch USB-meter frame from named fields.
-
-    Inverts the decoder's field math (e.g. multiplies voltage by 100) and
-    splits ``duration_s`` back into the days/hours/minutes/seconds tuple
-    the wire format uses. Reserved bytes and the tail are zero-filled. The
-    checksum is computed per the documented formula so the frame stays
-    valid if/when :data:`atorch_ble._decoder._CHECKSUM_VALIDATED` flips
-    to ``True``.
-
-    Ticket #4 will port this helper to a shared fixtures module.
-    """
-
-    body = bytearray(36)
-    body[0:2] = b"\xff\x55"
-    body[2] = 0x01
-    body[3] = packet_type
-    body[0x04:0x07] = _u24_be(round(voltage_v * 100))
-    body[0x07:0x0A] = _u24_be(round(current_a * 100))
-    body[0x0A:0x0D] = _u24_be(capacity_mah)
-    body[0x0D:0x11] = _u32_be(round(energy_wh * 100))
-    body[0x11:0x13] = _u16_be(round(voltage_dplus_v * 100))
-    body[0x13:0x15] = _u16_be(round(voltage_dminus_v * 100))
-    body[0x15:0x17] = _u16_be(temperature_c)
-
-    days, rem = divmod(duration_s, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-    body[0x17] = days
-    body[0x18] = hours
-    body[0x19] = minutes
-    body[0x1A] = seconds
-
-    # 0x1B..0x20 reserved (zero-filled by bytearray(36)).
-    body[0x21] = (sum(body[2:33]) & 0xFF) ^ 0x44
-    # 0x22..0x23 tail (zero-filled).
-
-    return bytes(body)
+def test_decode_zero_frame() -> None:
+    reading = decode_usb_meter(ZERO_FRAME)
+    assert _reading_dict(reading) == ZERO_EXPECTED
 
 
-def test_decode_usb_meter_happy_path() -> None:
+def test_decode_max_frame() -> None:
+    reading = decode_usb_meter(MAX_FRAME)
+    assert _reading_dict(reading) == MAX_EXPECTED
+
+
+def test_decode_mid_range_frame() -> None:
+    reading = decode_usb_meter(MID_FRAME)
+    assert _reading_dict(reading) == MID_EXPECTED
+
+
+# ---------------------------------------------------------------------------
+# Field-by-field invariants on the canonical frame
+# ---------------------------------------------------------------------------
+
+
+def test_voltage_scaled_by_100() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert reading.voltage_v == 5.12
+
+
+def test_current_scaled_by_100() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert reading.current_a == 1.23
+
+
+def test_capacity_is_raw_mah() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert reading.capacity_mah == 456
+
+
+def test_energy_scaled_by_100() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert reading.energy_wh == 7.89
+
+
+def test_voltage_dplus_dminus_scaled_by_100() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert reading.voltage_dplus_v == 2.71
+    assert reading.voltage_dminus_v == 2.72
+
+
+def test_duration_arithmetic_combines_components() -> None:
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert reading.duration_s == 1 * 86400 + 2 * 3600 + 3 * 60 + 4
+
+
+def test_duration_at_255_day_rollover_not_reset() -> None:
+    """255 days is the documented ceiling at which the wire format would
+    wrap a u8 day counter; the decoder simply adds days*86400, so a
+    255-day frame must decode to a value larger than 254 * 86400."""
+
     frame = build_frame(
-        voltage_v=5.12,
-        current_a=1.23,
-        capacity_mah=456,
-        energy_wh=7.89,
-        voltage_dplus_v=2.71,
-        voltage_dminus_v=2.72,
-        temperature_c=27,
-        duration_s=1 * 86400 + 2 * 3600 + 3 * 60 + 4,
-    )
-
-    reading = decode_usb_meter(frame)
-
-    assert reading == UsbMeterReading(
-        voltage_v=5.12,
-        current_a=1.23,
-        capacity_mah=456,
-        energy_wh=7.89,
-        voltage_dplus_v=2.71,
-        voltage_dminus_v=2.72,
-        temperature_c=27,
-        duration_s=1 * 86400 + 2 * 3600 + 3 * 60 + 4,
-    )
-
-
-def test_decode_usb_meter_rejects_bad_magic() -> None:
-    frame = bytearray(
-        build_frame(
-            voltage_v=5.0,
-            current_a=1.0,
-            capacity_mah=0,
-            energy_wh=0.0,
-            voltage_dplus_v=0.0,
-            voltage_dminus_v=0.0,
-            temperature_c=25,
-            duration_s=0,
-        )
-    )
-    frame[0] = 0x00  # break the magic
-
-    with pytest.raises(InvalidPacket):
-        decode_usb_meter(bytes(frame))
-
-
-def test_decode_usb_meter_rejects_wrong_length() -> None:
-    with pytest.raises(InvalidPacket):
-        decode_usb_meter(b"\xff\x55\x01\x03" + b"\x00" * 10)
-
-
-def test_decode_usb_meter_rejects_wrong_direction() -> None:
-    frame = bytearray(
-        build_frame(
-            voltage_v=5.0,
-            current_a=1.0,
-            capacity_mah=0,
-            energy_wh=0.0,
-            voltage_dplus_v=0.0,
-            voltage_dminus_v=0.0,
-            temperature_c=25,
-            duration_s=0,
-        )
-    )
-    frame[2] = 0x02  # not from-device
-
-    with pytest.raises(InvalidPacket):
-        decode_usb_meter(bytes(frame))
-
-
-def test_decode_usb_meter_rejects_unsupported_packet_type() -> None:
-    frame = build_frame(
-        voltage_v=5.0,
-        current_a=1.0,
+        voltage_v=0.0,
+        current_a=0.0,
         capacity_mah=0,
         energy_wh=0.0,
         voltage_dplus_v=0.0,
         voltage_dminus_v=0.0,
-        temperature_c=25,
-        duration_s=0,
-        packet_type=0x02,
+        temperature_c=0,
+        duration_s=255 * 86400 + 1 * 3600 + 2 * 60 + 3,
     )
+    reading = decode_usb_meter(frame)
+    assert reading.duration_s == 255 * 86400 + 1 * 3600 + 2 * 60 + 3
 
+
+def test_temperature_is_unsigned_u16() -> None:
+    """A 0xFFFF temperature slot must decode to 65535, not -1 or 0."""
+
+    frame = bytearray(CANONICAL_FRAME)
+    frame[0x15:0x17] = b"\xff\xff"
+    # Recompute the checksum so this still passes the gate.
+    frame[0x21] = (sum(frame[2:33]) & 0xFF) ^ 0x44
+    reading = decode_usb_meter(bytes(frame))
+    assert reading.temperature_c == 65535
+
+
+def test_big_endian_voltage_encoding() -> None:
+    """0x010000 in big-endian (with /100 divisor) is 655.36 V."""
+
+    raw = 0x010000  # = 65_536
+    frame = bytearray(CANONICAL_FRAME)
+    frame[0x04:0x07] = raw.to_bytes(3, "big")
+    frame[0x21] = (sum(frame[2:33]) & 0xFF) ^ 0x44
+    reading = decode_usb_meter(bytes(frame))
+    assert reading.voltage_v == raw / 100.0
+
+
+# ---------------------------------------------------------------------------
+# Rejection gates
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_wrong_length_too_short() -> None:
+    with pytest.raises(InvalidPacket):
+        decode_usb_meter(frame_too_short())
+
+
+def test_rejects_wrong_length_too_long() -> None:
+    with pytest.raises(InvalidPacket):
+        decode_usb_meter(frame_too_long())
+
+
+def test_rejects_bad_magic() -> None:
+    with pytest.raises(InvalidPacket):
+        decode_usb_meter(frame_with_bad_magic())
+
+
+def test_rejects_wrong_direction() -> None:
+    with pytest.raises(InvalidPacket):
+        decode_usb_meter(frame_with_bad_direction())
+
+
+@pytest.mark.parametrize("packet_type", [0x01, 0x02])
+def test_rejects_unsupported_packet_type(packet_type: int) -> None:
+    frame = frame_with_packet_type(packet_type)
     with pytest.raises(UnsupportedPacketType) as excinfo:
         decode_usb_meter(frame)
-    assert excinfo.value.packet_type == 0x02
+    assert excinfo.value.packet_type == packet_type
+
+
+def test_unsupported_packet_type_is_invalid_packet_subclass() -> None:
+    """Documented hierarchy: UnsupportedPacketType extends InvalidPacket."""
+
+    assert issubclass(UnsupportedPacketType, InvalidPacket)
+
+
+# ---------------------------------------------------------------------------
+# Checksum validation (gated by the shared _CHECKSUM_VALIDATED flag)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not _CHECKSUM_VALIDATED,
+    reason="checksum formula not yet confirmed; see ticket #3 / #4",
+)
+def test_corrupted_checksum_raises_invalid_packet() -> None:
+    with pytest.raises(InvalidPacket):
+        decode_usb_meter(frame_with_corrupted_checksum())
+
+
+@pytest.mark.skipif(
+    not _CHECKSUM_VALIDATED,
+    reason="checksum formula not yet confirmed; see ticket #3 / #4",
+)
+def test_canonical_frame_passes_checksum_gate() -> None:
+    """The build_frame helper computes the same XOR formula the decoder
+    enforces, so the canonical frame must decode without raising."""
+
+    reading = decode_usb_meter(CANONICAL_FRAME)
+    assert isinstance(reading, UsbMeterReading)
+
+
+def test_build_frame_checksum_byte_matches_documented_formula() -> None:
+    """Independent of the gate: the fixture's checksum byte must equal
+    the formula output. This guards against the fixture builder
+    silently drifting from the decoder's expectation."""
+
+    expected = (sum(CANONICAL_FRAME[2:33]) & 0xFF) ^ 0x44
+    assert CANONICAL_FRAME[0x21] == expected

@@ -25,14 +25,17 @@ _DIR_FROM_DEVICE: int = 0x01
 _TYPE_USB_METER: int = 0x03
 _EXPECTED_LEN: int = 36
 
-_CHECKSUM_VALIDATED: bool = False
+_CHECKSUM_VALIDATED: bool = True
 """Gate for checksum enforcement.
 
 The documented Atorch checksum formula is
-``(sum(payload[2:33]) & 0xFF) ^ 0x44``. Ticket #4 will validate it against
-real captures; until that fixture-driven verification lands, we compute the
-checksum but do not raise on mismatch. When flipped to ``True``,
-:func:`decode_usb_meter` will raise :class:`InvalidPacket` on mismatch.
+``(sum(payload[2:33]) & 0xFF) ^ 0x44``. Ticket #4 verified this formula
+is self-consistent against synthetic frames constructed from the
+PROJECT_CONTEXT.md offset table (Option B in that ticket's acceptance
+criteria); we have not yet verified the byte against a real captured
+frame, but the formula is self-checking via the test suite's
+fixture-built frames. With this flag ``True``,
+:func:`decode_usb_meter` raises :class:`InvalidPacket` on mismatch.
 """
 
 
@@ -75,11 +78,13 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
     ``voltage_v / current_a`` when ``current_a > 0``).
 
     Checksum behaviour: the documented formula
-    ``(sum(payload[2:33]) & 0xFF) ^ 0x44`` is computed unconditionally, but
-    enforcement is gated by :data:`_CHECKSUM_VALIDATED`. While that flag is
-    ``False`` we skip the mismatch check; length, magic, direction, and
-    packet-type gates remain in force. Ticket #4 flips the flag to ``True``
-    after fixture-driven verification against real captures.
+    ``(sum(payload[2:33]) & 0xFF) ^ 0x44`` is computed unconditionally,
+    and enforcement is gated by :data:`_CHECKSUM_VALIDATED`. Ticket #4
+    flipped that flag to ``True`` after fixture-driven verification
+    against synthetic frames built from the PROJECT_CONTEXT.md offset
+    table; the formula has not yet been independently confirmed against
+    a real captured frame's checksum byte, but the test suite asserts
+    self-consistency.
 
     Args:
         payload: The reassembled 36-byte BLE frame.
