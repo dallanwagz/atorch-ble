@@ -20,6 +20,8 @@ from .fixtures.known_frames import (
     MAX_FRAME,
     MID_EXPECTED,
     MID_FRAME,
+    REAL_CAPTURED_EXPECTED,
+    REAL_CAPTURED_FRAME,
     ZERO_EXPECTED,
     ZERO_FRAME,
     _compute_checksum,
@@ -132,7 +134,7 @@ def test_temperature_is_unsigned_u16() -> None:
     frame = bytearray(CANONICAL_FRAME)
     frame[0x15:0x17] = b"\xff\xff"
     # Recompute the checksum so this still passes the gate.
-    frame[0x21] = _compute_checksum(frame)
+    frame[0x23] = _compute_checksum(frame)
     reading = decode_usb_meter(bytes(frame))
     assert reading.temperature_c == 65535
 
@@ -143,7 +145,7 @@ def test_big_endian_voltage_encoding() -> None:
     raw = 0x010000  # = 65_536
     frame = bytearray(CANONICAL_FRAME)
     frame[0x04:0x07] = raw.to_bytes(3, "big")
-    frame[0x21] = _compute_checksum(frame)
+    frame[0x23] = _compute_checksum(frame)
     reading = decode_usb_meter(bytes(frame))
     assert reading.voltage_v == raw / 100.0
 
@@ -210,5 +212,30 @@ def test_build_frame_checksum_byte_matches_documented_formula() -> None:
     the formula output. This guards against the fixture builder
     silently drifting from the decoder's expectation."""
 
-    expected = (sum(CANONICAL_FRAME[2:33]) & 0xFF) ^ 0x44
-    assert CANONICAL_FRAME[0x21] == expected
+    expected = (sum(CANONICAL_FRAME[0x03:0x23]) & 0xFF) ^ 0x44
+    assert CANONICAL_FRAME[0x23] == expected
+
+
+# ---------------------------------------------------------------------------
+# Real captured frame (golden regression vector)
+# ---------------------------------------------------------------------------
+
+
+def test_decode_real_captured_frame_matches_hand_computed_expected() -> None:
+    """A real J7-C frame captured from a live meter must decode to its
+    hand-computed field values. This is the regression anchor for the
+    checksum fix — under the previous (wrong) sum range and offset this
+    real frame failed the checksum gate."""
+
+    reading = decode_usb_meter(REAL_CAPTURED_FRAME)
+    assert _reading_dict(reading) == REAL_CAPTURED_EXPECTED
+
+
+def test_real_captured_frame_checksum_byte_is_authoritative() -> None:
+    """The captured frame's own trailing byte must satisfy the checksum
+    formula — proving the formula was reverse-engineered from real
+    hardware output, not asserted self-consistently against a fixture."""
+
+    expected = (sum(REAL_CAPTURED_FRAME[0x03:0x23]) & 0xFF) ^ 0x44
+    assert REAL_CAPTURED_FRAME[0x23] == expected
+    assert REAL_CAPTURED_FRAME[0x23] == 0xD8

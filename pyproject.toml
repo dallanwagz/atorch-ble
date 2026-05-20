@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atorch-ble"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone parser for the Atorch BLE protocol (J7-C / UC96 and related USB/AC/DC meters)."
 readme = "README.md"
 requires-python = ">=3.12"

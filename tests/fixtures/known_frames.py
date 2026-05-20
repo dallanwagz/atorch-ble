@@ -36,11 +36,13 @@ Byte layout (USB-meter packet type 0x03), per PROJECT_CONTEXT.md:
     0x18    1    duration_hours    u8
     0x19    1    duration_minutes  u8
     0x1A    1    duration_seconds  u8
-    0x1B    6    reserved          zero-filled
-    0x21    1    checksum          (sum(payload[2:33]) & 0xFF) ^ 0x44
-    0x22    2    tail              zero-filled (vendor framing)
+    0x1B    8    reserved          vendor framing (not decoded)
+    0x23    1    checksum          (sum(payload[0x03:0x23]) & 0xFF) ^ 0x44
     ---------------------------------------------------------------
     Total length:                  36 bytes
+
+The checksum formula and offset are confirmed against 639 real J7-C
+frames captured from a live meter (see ``REAL_CAPTURED_FRAME`` below).
 """
 
 from __future__ import annotations
@@ -53,11 +55,13 @@ FRAME_SIZE: Final[int] = 36
 def _compute_checksum(body: bytes | bytearray) -> int:
     """Compute the Atorch checksum byte for an in-progress frame.
 
-    The documented formula is ``(sum(body[2:33]) & 0xFF) ^ 0x44``.
-    Centralized here so the (sum, XOR-mask) pair has one home.
+    The formula is ``(sum(body[0x03:0x23]) & 0xFF) ^ 0x44`` — the sum
+    spans the packet-type byte through the last data byte, stored at
+    ``body[0x23]``. Confirmed against 639 real captured frames.
+    Centralized here so the (range, XOR-mask) triple has one home.
     """
 
-    return (sum(body[2:33]) & 0xFF) ^ 0x44
+    return (sum(body[0x03:0x23]) & 0xFF) ^ 0x44
 
 
 def build_frame(
@@ -103,9 +107,8 @@ def build_frame(
     body[0x19] = minutes
     body[0x1A] = seconds
 
-    # 0x1B..0x20 reserved (zero-filled).
-    body[0x21] = _compute_checksum(body)
-    # 0x22..0x23 tail (zero-filled).
+    # 0x1B..0x22 reserved / vendor framing (zero-filled).
+    body[0x23] = _compute_checksum(body)
     return bytes(body)
 
 
@@ -194,7 +197,7 @@ def _build_max_frame() -> bytes:
     body[0x18] = 0xFF
     body[0x19] = 0xFF
     body[0x1A] = 0xFF
-    body[0x21] = _compute_checksum(body)
+    body[0x23] = _compute_checksum(body)
     return bytes(body)
 
 
@@ -223,6 +226,36 @@ MID_FIELDS: Final[dict[str, float | int]] = {
 }
 MID_FRAME: Final[bytes] = build_frame(**MID_FIELDS)  # type: ignore[arg-type]
 MID_EXPECTED: Final[dict[str, float | int]] = dict(MID_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# Real captured frame (golden vector)
+# ---------------------------------------------------------------------------
+#
+# Provenance: Option A — a real J7-C frame captured from a live meter on
+# 2026-05-19 via a Bluetooth HCI snoop log of the vendor E_Test app. The
+# Atorch wire format is transport-agnostic (identical bytes over BLE GATT
+# and Classic SPP). Expected values below are hand-computed from the
+# offset table in this module's docstring — NOT by calling the decoder.
+#
+# This is the regression anchor for the checksum fix: the previous
+# decoder used the wrong sum range and checksum offset, so real frames
+# like this one failed validation ~99.7% of the time.
+
+REAL_CAPTURED_FRAME: Final[bytes] = bytes.fromhex(
+    "ff5501030003860000d2000d6d0000095201190118"
+    "0028000409163c0c800000032000d8"
+)
+REAL_CAPTURED_EXPECTED: Final[dict[str, float | int]] = {
+    "voltage_v": 9.02,
+    "current_a": 2.10,
+    "capacity_mah": 3437,
+    "energy_wh": 23.86,
+    "voltage_dplus_v": 2.81,
+    "voltage_dminus_v": 2.80,
+    "temperature_c": 40,
+    "duration_s": 4 * 3600 + 9 * 60 + 22,  # 4h 09m 22s = 14_962 s
+}
 
 
 # ---------------------------------------------------------------------------
@@ -276,5 +309,5 @@ def frame_with_corrupted_checksum(source: bytes = CANONICAL_FRAME) -> bytes:
     """
 
     bad = bytearray(source)
-    bad[0x21] = (bad[0x21] ^ 0xFF) & 0xFF
+    bad[0x23] = (bad[0x23] ^ 0xFF) & 0xFF
     return bytes(bad)

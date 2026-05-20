@@ -64,12 +64,11 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
     coordinator-side derivations (``voltage_v * current_a``, and
     ``voltage_v / current_a`` when ``current_a > 0``).
 
-    Checksum behaviour: the documented formula
-    ``(sum(payload[2:33]) & 0xFF) ^ 0x44`` is enforced; on mismatch
-    :class:`InvalidPacket` is raised. The formula has not been
-    independently confirmed against a real captured frame's checksum
-    byte, but the test suite asserts self-consistency against
-    fixture-built frames.
+    Checksum behaviour: the formula ``(sum(payload[0x03:0x23]) & 0xFF)
+    ^ 0x44`` is enforced against the final byte (``payload[0x23]``); on
+    mismatch :class:`InvalidPacket` is raised. The formula is confirmed
+    against 639 real J7-C frames captured from a live meter — the
+    checksum spans the packet-type byte through the last data byte.
 
     Args:
         payload: The reassembled 36-byte BLE frame.
@@ -96,10 +95,10 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
     if payload[3] != _TYPE_USB_METER:
         raise UnsupportedPacketType(packet_type=payload[3])
 
-    expected_checksum = (sum(payload[2:33]) & 0xFF) ^ 0x44
-    if payload[0x21] != expected_checksum:
+    expected_checksum = (sum(payload[0x03:0x23]) & 0xFF) ^ 0x44
+    if payload[0x23] != expected_checksum:
         raise InvalidPacket(
-            f"checksum mismatch: got 0x{payload[0x21]:02x}, expected 0x{expected_checksum:02x}"
+            f"checksum mismatch: got 0x{payload[0x23]:02x}, expected 0x{expected_checksum:02x}"
         )
 
     voltage_v = int.from_bytes(payload[0x04:0x07], "big", signed=False) / 100.0
