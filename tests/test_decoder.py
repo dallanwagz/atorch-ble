@@ -104,16 +104,23 @@ def test_voltage_dplus_dminus_scaled_by_100() -> None:
     assert reading.voltage_dminus_v == 2.72
 
 
-def test_duration_arithmetic_combines_components() -> None:
+def test_duration_combines_u16_hours_minutes_seconds() -> None:
     reading = decode_usb_meter(CANONICAL_FRAME)
-    assert reading.duration_s == 1 * 86400 + 2 * 3600 + 3 * 60 + 4
+    assert reading.duration_s == 26 * 3600 + 3 * 60 + 4
 
 
-def test_duration_at_255_day_rollover_not_reset() -> None:
-    """255 days is the documented ceiling at which the wire format would
-    wrap a u8 day counter; the decoder simply adds days*86400, so a
-    255-day frame must decode to a value larger than 254 * 86400."""
+def test_duration_hours_field_is_16_bit_not_days_plus_hours() -> None:
+    """The hours component is a 16-bit big-endian counter at 0x17-0x18,
+    not a u8 days byte (0x17) plus a u8 hours byte (0x18).
 
+    Regression guard for the bug where the decoder read 0x17 as ``days``
+    and multiplied it by 86400. That interpretation is numerically
+    identical only while total hours stay under 256 (high byte zero), so
+    this test deliberately uses 1037 hours (high byte = 4) where the two
+    interpretations diverge, and pins the on-wire byte layout directly.
+    """
+
+    duration_s = 1037 * 3600 + 46 * 60 + 23
     frame = build_frame(
         voltage_v=0.0,
         current_a=0.0,
@@ -122,10 +129,38 @@ def test_duration_at_255_day_rollover_not_reset() -> None:
         voltage_dplus_v=0.0,
         voltage_dminus_v=0.0,
         temperature_c=0,
-        duration_s=255 * 86400 + 1 * 3600 + 2 * 60 + 3,
+        duration_s=duration_s,
     )
+    # On the wire: hours occupy two bytes as a big-endian u16.
+    assert frame[0x17:0x19] == (1037).to_bytes(2, "big")  # 0x04 0x0D
+    assert frame[0x19] == 46
+    assert frame[0x1A] == 23
+
     reading = decode_usb_meter(frame)
-    assert reading.duration_s == 255 * 86400 + 1 * 3600 + 2 * 60 + 3
+    assert reading.duration_s == duration_s
+    # The buggy days/hours split would have yielded a much smaller value.
+    buggy = frame[0x17] * 86400 + frame[0x18] * 3600 + frame[0x19] * 60 + frame[0x1A]
+    assert reading.duration_s != buggy
+
+
+def test_decode_frame_with_high_hours_byte_set() -> None:
+    """Golden hardcoded-bytes vector with a nonzero hours high byte.
+
+    Unlike the round-trip fixtures (whose builder shares the decoder's
+    layout assumption), this pins raw bytes the decoder did not produce:
+    duration bytes 0x17-0x1A = 04 0D 2E 17 -> u16 hours 0x040D = 1037,
+    minutes 0x2E = 46, seconds 0x17 = 23. This vector FAILS under the old
+    days/hours decoder (which would read 4 days + 13 hours) and PASSES
+    under the 16-bit-hours decoder.
+    """
+
+    frame = bytearray(CANONICAL_FRAME)
+    frame[0x17:0x1B] = bytes([0x04, 0x0D, 0x2E, 0x17])
+    frame[0x23] = _compute_checksum(frame)
+
+    reading = decode_usb_meter(bytes(frame))
+    assert reading.duration_s == 1037 * 3600 + 46 * 60 + 23
+    assert reading.duration_s != 4 * 86400 + 13 * 3600 + 46 * 60 + 23
 
 
 def test_temperature_is_unsigned_u16() -> None:

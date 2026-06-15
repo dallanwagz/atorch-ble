@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.2] - 2026-06-15
+
+### Fixed
+- USB-meter duration decode. The decoder read byte `0x17` as a `days`
+  counter and byte `0x18` as `hours`, then computed
+  `days*86400 + hours*3600 + …`. The wire format is actually
+  `hours:minutes:seconds`, where `hours` is a **16-bit big-endian**
+  counter spanning bytes `0x17`-`0x18` (there is no days byte). The two
+  interpretations are numerically identical only while total runtime
+  stays under 256 hours (high byte zero); past ~10.6 days continuous the
+  old decode under-reported. Now decoded as
+  `u16(0x17:0x19)*3600 + minutes*60 + seconds`. Confirmed against the
+  official Atorch "E_Test" Android app, which reads `u16(0x17,0x18)` as
+  the hour field and displays `HH:MM:SS` with no days component.
+
+### Added
+- Golden regression vector `test_decode_frame_with_high_hours_byte_set`
+  pinning raw bytes with a nonzero hours high byte (`0x17`=4), which
+  fails under the old days/hours decode and passes under the 16-bit-hours
+  decode. The round-trip fixtures could not have caught this because the
+  fixture builder shared the decoder's (wrong) layout assumption.
+
 ## [0.1.1] - 2026-05-19
 
 ### Fixed

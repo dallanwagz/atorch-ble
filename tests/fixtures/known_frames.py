@@ -32,8 +32,7 @@ Byte layout (USB-meter packet type 0x03), per PROJECT_CONTEXT.md:
     0x11    2    voltage_d_plus    u16 big-endian       /100  -> volts
     0x13    2    voltage_d_minus   u16 big-endian       /100  -> volts
     0x15    2    temperature       u16 big-endian       raw degrees C (unsigned)
-    0x17    1    duration_days     u8
-    0x18    1    duration_hours    u8
+    0x17    2    duration_hours    u16 big-endian       total hours (NOT days+hours)
     0x19    1    duration_minutes  u8
     0x1A    1    duration_seconds  u8
     0x1B    8    reserved          vendor framing (not decoded)
@@ -80,11 +79,12 @@ def build_frame(
     """Build a 36-byte Atorch USB-meter frame from named fields.
 
     The helper inverts the decoder's field math (e.g. multiplies voltage
-    by 100) and splits ``duration_s`` back into the days/hours/minutes/
-    seconds tuple the wire format uses. Reserved bytes and the trailing
-    framing bytes are zero-filled. The checksum is computed per the
-    documented XOR formula so the frame is accepted by the decoder
-    whether or not its checksum gate is enabled.
+    by 100) and splits ``duration_s`` back into the 16-bit-hours /
+    minutes / seconds layout the wire format uses (hours occupy bytes
+    0x17-0x18 as a big-endian u16; there is no days byte). Reserved bytes
+    and the trailing framing bytes are zero-filled. The checksum is
+    computed per the documented XOR formula so the frame is accepted by
+    the decoder whether or not its checksum gate is enabled.
     """
 
     body = bytearray(FRAME_SIZE)
@@ -99,11 +99,9 @@ def build_frame(
     body[0x13:0x15] = round(voltage_dminus_v * 100).to_bytes(2, "big")
     body[0x15:0x17] = temperature_c.to_bytes(2, "big")
 
-    days, rem = divmod(duration_s, 86400)
-    hours, rem = divmod(rem, 3600)
+    hours, rem = divmod(duration_s, 3600)
     minutes, seconds = divmod(rem, 60)
-    body[0x17] = days
-    body[0x18] = hours
+    body[0x17:0x19] = hours.to_bytes(2, "big")
     body[0x19] = minutes
     body[0x1A] = seconds
 
@@ -129,8 +127,8 @@ CANONICAL_FIELDS: Final[dict[str, float | int]] = {
     "voltage_dplus_v": 2.71,
     "voltage_dminus_v": 2.72,
     "temperature_c": 27,
-    # 1 day, 2 hours, 3 minutes, 4 seconds = 93_784 s
-    "duration_s": 1 * 86400 + 2 * 3600 + 3 * 60 + 4,
+    # 26 hours, 3 minutes, 4 seconds = 93_784 s (hours high byte still 0)
+    "duration_s": 26 * 3600 + 3 * 60 + 4,
 }
 
 CANONICAL_FRAME: Final[bytes] = build_frame(**CANONICAL_FIELDS)  # type: ignore[arg-type]
@@ -158,27 +156,28 @@ ZERO_EXPECTED: Final[dict[str, float | int]] = dict(ZERO_FIELDS)
 
 # Max per-field values constrained to each field's wire width:
 #   u24 max = 16_777_215     u32 max = 4_294_967_295     u16 max = 65_535
-#   day/hr/min/sec are each u8 (255 max).
+#   hours is a u16 (65_535 max); minutes/seconds are each u8 (255 max).
 #
 # Voltage/current/energy/d+/d- carry a /100 divisor, so the float value
-# of "max raw bytes" is rawmax / 100. Duration: we set each of the four
-# duration bytes to 0xFF on the wire — the *decoded* duration is then
-# days*86400 + hours*3600 + minutes*60 + seconds with all four
-# components at 255. This intentionally exercises the documented
-# "duration components are *not* clamped at the day rollover".
+# of "max raw bytes" is rawmax / 100. Duration: we set all four duration
+# bytes to 0xFF on the wire — the *decoded* duration is then
+# u16_hours*3600 + minutes*60 + seconds with hours at 0xFFFF and
+# minutes/seconds at 255. This intentionally exercises that the
+# minute/second components are *not* clamped to 0-59.
 MAX_RAW_U24: Final[int] = 0xFFFFFF
 MAX_RAW_U32: Final[int] = 0xFFFFFFFF
 MAX_RAW_U16: Final[int] = 0xFFFF
-MAX_DURATION_S: Final[int] = 255 * 86400 + 255 * 3600 + 255 * 60 + 255
+MAX_DURATION_S: Final[int] = 0xFFFF * 3600 + 255 * 60 + 255
 
 
 def _build_max_frame() -> bytes:
     """Build the max-per-field frame.
 
     ``build_frame`` re-splits ``duration_s`` via divmod, which would
-    overflow the u8 ``days`` byte if we asked for 22_975_635 seconds.
-    Instead we ask for a zero-duration frame, then overwrite the four
-    duration bytes with ``0xFF`` directly and recompute the checksum.
+    overflow the u16 ``hours`` field (and not let us pin minutes/seconds
+    to 0xFF) if we asked for the raw max in seconds. Instead we ask for a
+    zero-duration frame, then overwrite the four duration bytes with
+    ``0xFF`` directly and recompute the checksum.
     """
 
     body = bytearray(

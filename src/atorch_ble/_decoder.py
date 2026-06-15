@@ -109,11 +109,17 @@ def decode_usb_meter(payload: bytes) -> UsbMeterReading:
     voltage_dminus_v = int.from_bytes(payload[0x13:0x15], "big", signed=False) / 100.0
     temperature_c = int.from_bytes(payload[0x15:0x17], "big", signed=False)
 
-    days = payload[0x17]
-    hours = payload[0x18]
+    # Time record is hours:minutes:seconds, where "hours" is a 16-bit
+    # big-endian counter spanning bytes 0x17-0x18 (NOT a days byte + an
+    # hours byte). Confirmed against the official Atorch "E_Test" app,
+    # which reads ``u16(0x17, 0x18)`` as the hour field and displays
+    # HH:MM:SS with no days component. The earlier days/hours split was
+    # numerically identical only while total runtime stayed under 256
+    # hours (high byte zero); past ~10.6 days continuous it under-reported.
+    hours = int.from_bytes(payload[0x17:0x19], "big", signed=False)
     minutes = payload[0x19]
     seconds = payload[0x1A]
-    duration_s = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    duration_s = hours * 3600 + minutes * 60 + seconds
 
     return UsbMeterReading(
         voltage_v=voltage_v,
