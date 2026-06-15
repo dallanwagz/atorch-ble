@@ -242,8 +242,7 @@ MID_EXPECTED: Final[dict[str, float | int]] = dict(MID_FIELDS)
 # like this one failed validation ~99.7% of the time.
 
 REAL_CAPTURED_FRAME: Final[bytes] = bytes.fromhex(
-    "ff5501030003860000d2000d6d0000095201190118"
-    "0028000409163c0c800000032000d8"
+    "ff5501030003860000d2000d6d00000952011901180028000409163c0c800000032000d8"
 )
 REAL_CAPTURED_EXPECTED: Final[dict[str, float | int]] = {
     "voltage_v": 9.02,
